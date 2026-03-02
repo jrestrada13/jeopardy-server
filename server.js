@@ -149,8 +149,8 @@ const DEFAULT_CLUES = [
 
 const DEFAULT_FINAL = {
   category: "Texas Rising",
-  clue: "Between 1865 and 1920, three industries — cattle, railroads, and oil — fundamentally transformed Texas. Identify all three industries and explain how each one changed Texas economically, socially, or geographically. Use specific evidence.",
-  answer: "Cattle: longhorn drives → national beef market, end of open range. Railroads: connected Texas to national economy, created boomtowns, enabled regulation via Railroad Commission. Oil: Spindletop 1901, boom-and-bust cycles, transformed Texas into industrial/energy powerhouse."
+  clue: "This January 10, 1901 discovery near Beaumont transformed Texas from an agricultural state into an industrial powerhouse and is considered the birth of the modern oil industry.",
+  answer: "Spindletop"
 };
 
 // ── SOCKET EVENTS ──
@@ -231,8 +231,59 @@ io.on('connection', (socket) => {
     g.activeClue = { col, row, timerSecs: timerSecs || 30, timerStart: Date.now() };
     g.buzzOrder = [];
     g.verdicts = {};
+    g.submissions = {}; // teamId -> submitted answer string
     Object.keys(g.teams).forEach(tid => g.verdicts[tid] = null);
     io.to(code).emit('game-update', getPublicGame(code));
+  });
+
+  // ── STUDENT: SUBMIT ANSWER ──
+  socket.on('submit-answer', ({ code, answer }) => {
+    const g = games[code];
+    if (!g || !g.activeClue) return;
+    const player = g.players[socket.id];
+    if (!player) return;
+    const { teamId } = player;
+    g.submissions[teamId] = answer.trim();
+    // Notify teacher only
+    if (g.teacherSocketId) {
+      io.to(g.teacherSocketId).emit('submission-update', {
+        submissions: g.submissions,
+        teamNames: Object.fromEntries(Object.entries(g.teams).map(([tid, t]) => [tid, t.name]))
+      });
+    }
+  });
+
+  // ── STUDENT: SUBMIT WAGER ──
+  socket.on('submit-wager', ({ code, wager }) => {
+    const g = games[code];
+    if (!g || g.phase !== 'final-wager') return;
+    const player = g.players[socket.id];
+    if (!player) return;
+    const { teamId } = player;
+    const maxWager = g.teams[teamId]?.score || 0;
+    g.wagers[teamId] = Math.min(Math.max(0, parseInt(wager) || 0), maxWager);
+    if (g.teacherSocketId) {
+      io.to(g.teacherSocketId).emit('wager-update', {
+        wagers: g.wagers,
+        teamNames: Object.fromEntries(Object.entries(g.teams).map(([tid, t]) => [tid, t.name]))
+      });
+    }
+  });
+
+  // ── STUDENT: SUBMIT FINAL ANSWER ──
+  socket.on('submit-final-answer', ({ code, answer }) => {
+    const g = games[code];
+    if (!g || g.phase !== 'final-answer') return;
+    const player = g.players[socket.id];
+    if (!player) return;
+    const { teamId } = player;
+    g.finalSubmissions[teamId] = answer.trim();
+    if (g.teacherSocketId) {
+      io.to(g.teacherSocketId).emit('final-submission-update', {
+        finalSubmissions: g.finalSubmissions,
+        teamNames: Object.fromEntries(Object.entries(g.teams).map(([tid, t]) => [tid, t.name]))
+      });
+    }
   });
 
   // ── STUDENT: BUZZ IN ──
@@ -256,12 +307,25 @@ io.on('connection', (socket) => {
   // ── TEACHER: REVEAL ANSWER ──
   socket.on('reveal-answer', ({ code }) => {
     const g = games[code];
-    if (!g || g.teacherSocketId !== socket.id || !g.activeClue) return;
-    const { col, row } = g.activeClue;
-    io.to(code).emit('answer-revealed', {
-      answer: g.clues[col][row].a,
-      game: getPublicGame(code)
-    });
+    if (!g || g.teacherSocketId !== socket.id) return;
+    const isNormalClue = g.activeClue && g.phase === 'playing';
+    const isFinal = g.phase === 'final-answer';
+    if (!isNormalClue && !isFinal) return;
+
+    if (isNormalClue) {
+      const { col, row } = g.activeClue;
+      io.to(code).emit('answer-revealed', {
+        answer: g.clues[col][row].a,
+        submissions: g.submissions || {},
+        game: getPublicGame(code)
+      });
+    } else {
+      io.to(code).emit('answer-revealed', {
+        answer: g.finalJeopardy.answer,
+        submissions: g.finalSubmissions || {},
+        game: getPublicGame(code)
+      });
+    }
   });
 
   // ── TEACHER: SET VERDICT ──
@@ -275,26 +339,46 @@ io.on('connection', (socket) => {
   // ── TEACHER: APPLY VERDICTS ──
   socket.on('apply-verdicts', ({ code }) => {
     const g = games[code];
-    if (!g || g.teacherSocketId !== socket.id || !g.activeClue) return;
-    const pts = VALUES[g.activeClue.row];
+    if (!g || g.teacherSocketId !== socket.id) return;
+    const isFinal = g.phase === 'final-answer';
+    if (!isFinal && !g.activeClue) return;
+
     const results = [];
 
-    Object.entries(g.verdicts).forEach(([teamId, verdict]) => {
-      if (!g.teams[teamId]) return;
-      if (verdict === 'correct') {
-        g.teams[teamId].score += pts;
-        results.push({ team: g.teams[teamId].name, delta: pts });
-      } else if (verdict === 'wrong') {
-        g.teams[teamId].score = Math.max(0, g.teams[teamId].score - pts);
-        results.push({ team: g.teams[teamId].name, delta: -pts });
-      }
-    });
-
-    // Mark clue used
-    g.board[g.activeClue.col][g.activeClue.row] = true;
-    g.activeClue = null;
-    g.buzzOrder = [];
-    g.verdicts = {};
+    if (isFinal) {
+      // Final Jeopardy — use wagers
+      Object.entries(g.verdicts).forEach(([teamId, verdict]) => {
+        if (!g.teams[teamId]) return;
+        const wager = g.wagers?.[teamId] || 0;
+        if (verdict === 'correct') {
+          g.teams[teamId].score += wager;
+          results.push({ team: g.teams[teamId].name, delta: wager });
+        } else if (verdict === 'wrong') {
+          g.teams[teamId].score = Math.max(0, g.teams[teamId].score - wager);
+          results.push({ team: g.teams[teamId].name, delta: -wager });
+        }
+      });
+      g.phase = 'ended';
+      g.verdicts = {};
+    } else {
+      // Normal clue — use point value
+      const pts = VALUES[g.activeClue.row];
+      Object.entries(g.verdicts).forEach(([teamId, verdict]) => {
+        if (!g.teams[teamId]) return;
+        if (verdict === 'correct') {
+          g.teams[teamId].score += pts;
+          results.push({ team: g.teams[teamId].name, delta: pts });
+        } else if (verdict === 'wrong') {
+          g.teams[teamId].score = Math.max(0, g.teams[teamId].score - pts);
+          results.push({ team: g.teams[teamId].name, delta: -pts });
+        }
+      });
+      g.board[g.activeClue.col][g.activeClue.row] = true;
+      g.activeClue = null;
+      g.buzzOrder = [];
+      g.submissions = {};
+      g.verdicts = {};
+    }
 
     io.to(code).emit('points-applied', { results, game: getPublicGame(code) });
   });
@@ -303,8 +387,25 @@ io.on('connection', (socket) => {
   socket.on('open-final', ({ code }) => {
     const g = games[code];
     if (!g || g.teacherSocketId !== socket.id) return;
-    g.phase = 'final';
+    g.phase = 'final-wager';
+    g.wagers = {};
+    g.finalSubmissions = {};
+    g.verdicts = {};
+    Object.keys(g.teams).forEach(tid => g.verdicts[tid] = null);
     io.to(code).emit('game-update', getPublicGame(code));
+  });
+
+  // ── TEACHER: ADVANCE FINAL (wager → answer phase) ──
+  socket.on('advance-final', ({ code }) => {
+    const g = games[code];
+    if (!g || g.teacherSocketId !== socket.id) return;
+    g.phase = 'final-answer';
+    io.to(code).emit('game-update', getPublicGame(code));
+    // Send clue to everyone
+    io.to(code).emit('final-clue-revealed', {
+      clue: g.finalJeopardy.clue,
+      category: g.finalJeopardy.category
+    });
   });
 
   // ── TEACHER: MANUAL SCORE ADJUST ──
