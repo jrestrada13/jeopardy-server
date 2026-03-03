@@ -100,6 +100,26 @@ function getPublicGame(code) {
   };
 }
 
+// ── SHEET PROXY ──
+const SHEET_BASE = 'https://docs.google.com/spreadsheets/d/e/2PACX-1vRUkte7Ys_f2Bp1b7eCQnOsxLYCkQ29p1qOdwMMt2_-0p8Hk50nFM8yotjSB-sDVGGvI_-xE6JMjMvc/pub';
+
+app.get('/sheet', async (req, res) => {
+  const { gid } = req.query;
+  if (!gid) return res.status(400).json({ error: 'Missing gid parameter' });
+  const url = `${SHEET_BASE}?gid=${gid}&single=true&output=csv`;
+  try {
+    const response = await fetch(url);
+    if (!response.ok) throw new Error(`Google returned ${response.status}`);
+    const text = await response.text();
+    res.setHeader('Content-Type', 'text/csv');
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.send(text);
+  } catch (e) {
+    console.error(`[sheet proxy] error for gid=${gid}:`, e.message);
+    res.status(502).json({ error: e.message });
+  }
+});
+
 // ── DEFAULT QUESTION DATA ──
 const DEFAULT_CATEGORIES = [
   "Cotton & Cowboys",
