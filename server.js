@@ -42,7 +42,53 @@ app.get('/', (req, res) => {
   res.json({ status: 'Jeopardy server running', games: Object.keys(games).length });
 });
 
-// ── GAME STATE ──
+// ── GAME EXPORT ──
+// Returns a CSV of all team answers and verdicts for a completed game
+app.get('/export/:code', (req, res) => {
+  const g = games[req.params.code];
+  if (!g) return res.status(404).json({ error: 'Game not found' });
+
+  const teams = Object.values(g.teams);
+  if (!teams.length) return res.status(400).json({ error: 'No teams in game' });
+
+  // Build CSV
+  const rows = [];
+
+  // Header row
+  const header = ['Team', 'Final Score'];
+  g.gameLog.forEach(entry => {
+    const label = entry.type === 'final'
+      ? `FINAL: ${entry.question.substring(0, 40)}`
+      : `${entry.category} $${entry.pts}: ${entry.question.substring(0, 40)}`;
+    header.push(`Answer: ${label}`);
+    header.push(`Verdict: ${label}`);
+    if (entry.type === 'final') header.push(`Wager: ${label}`);
+  });
+  rows.push(header);
+
+  // One row per team
+  teams.forEach(team => {
+    const teamId = Object.keys(g.teams).find(id => g.teams[id] === team);
+    const row = [team.name, team.score];
+    g.gameLog.forEach(entry => {
+      const ta = entry.teamAnswers[teamId] || {};
+      row.push(ta.answer || '');
+      row.push(ta.verdict || 'unset');
+      if (entry.type === 'final') row.push(ta.wager ?? '');
+    });
+    rows.push(row);
+  });
+
+  // Serialize to CSV
+  const csv = rows.map(row =>
+    row.map(cell => `"${String(cell).replace(/"/g, '""')}"`).join(',')
+  ).join('\n');
+
+  res.setHeader('Content-Type', 'text/csv');
+  res.setHeader('Content-Disposition', `attachment; filename="jeopardy-${req.params.code}.csv"`);
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.send(csv);
+});
 // games[code] = { ...gameState }
 const games = {};
 
@@ -69,6 +115,10 @@ function createGame(mode, categories, clues, finalJeopardy) {
     activeClue: null,   // { col, row, timerSecs, timerStart } | null
     buzzOrder: [],      // socketIds in buzz order
     verdicts: {},       // teamId -> 'correct' | 'wrong' | null
+    submissions: {},
+    wagers: {},
+    finalSubmissions: {},
+    gameLog: [],        // accumulated per-clue records for export
     categories,
     clues,
     finalJeopardy,
@@ -378,6 +428,25 @@ io.on('connection', (socket) => {
           results.push({ team: g.teams[teamId].name, delta: -wager });
         }
       });
+      // Log Final Jeopardy for export
+      const fjEntry = {
+        type: 'final',
+        category: g.finalJeopardy.category,
+        pts: 'wager',
+        question: g.finalJeopardy.clue,
+        correctAnswer: g.finalJeopardy.answer,
+        teamAnswers: {}
+      };
+      Object.keys(g.teams).forEach(teamId => {
+        fjEntry.teamAnswers[teamId] = {
+          teamName: g.teams[teamId].name,
+          answer: g.finalSubmissions[teamId] || '',
+          wager: g.wagers[teamId] || 0,
+          verdict: g.verdicts[teamId] || 'unset'
+        };
+      });
+      g.gameLog.push(fjEntry);
+
       g.phase = 'ended';
       g.verdicts = {};
     } else {
@@ -394,6 +463,26 @@ io.on('connection', (socket) => {
         }
       });
       g.board[g.activeClue.col][g.activeClue.row] = true;
+
+      // Log this clue for export
+      const { col, row } = g.activeClue;
+      const logEntry = {
+        type: 'clue',
+        category: g.categories[col],
+        pts: VALUES[row],
+        question: g.clues[col][row].q,
+        correctAnswer: g.clues[col][row].a,
+        teamAnswers: {}
+      };
+      Object.keys(g.teams).forEach(teamId => {
+        logEntry.teamAnswers[teamId] = {
+          teamName: g.teams[teamId].name,
+          answer: g.submissions[teamId] || '',
+          verdict: g.verdicts[teamId] || 'unset'
+        };
+      });
+      g.gameLog.push(logEntry);
+
       g.activeClue = null;
       g.buzzOrder = [];
       g.submissions = {};
