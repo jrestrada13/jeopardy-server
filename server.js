@@ -95,21 +95,20 @@ function getPublicGame(code) {
     } : null,
     buzzOrder: g.buzzOrder,
     verdicts: g.verdicts,
+    lockedTeamId: g.lockedTeamId || null,
+    lockedOut: g.lockedOut ? Array.from(g.lockedOut) : [],
     categories: g.categories,
     finalJeopardy: g.phase === 'final' ? g.finalJeopardy : null,
   };
 }
 
 // ── SHEET PROXY ──
-// Accepts either:
-//   ?gid=123456       → Jeopardy sheet (uses hardcoded base URL)
-//   ?url=https://...  → Any published Google Sheet CSV (stocks, etc.)
 const SHEET_BASE = 'https://docs.google.com/spreadsheets/d/e/2PACX-1vRUkte7Ys_f2Bp1b7eCQnOsxLYCkQ29p1qOdwMMt2_-0p8Hk50nFM8yotjSB-sDVGGvI_-xE6JMjMvc/pub';
 
 app.get('/sheet', async (req, res) => {
-  const { gid, url: fullUrl } = req.query;
-  if (!gid && !fullUrl) return res.status(400).json({ error: 'Missing gid or url parameter' });
-  const url = fullUrl || `${SHEET_BASE}?gid=${gid}&single=true&output=csv`;
+  const { gid } = req.query;
+  if (!gid) return res.status(400).json({ error: 'Missing gid parameter' });
+  const url = `${SHEET_BASE}?gid=${gid}&single=true&output=csv`;
   try {
     const response = await fetch(url);
     if (!response.ok) throw new Error(`Google returned ${response.status}`);
@@ -118,7 +117,7 @@ app.get('/sheet', async (req, res) => {
     res.setHeader('Access-Control-Allow-Origin', '*');
     res.send(text);
   } catch (e) {
-    console.error(`[sheet proxy] error:`, e.message);
+    console.error(`[sheet proxy] error for gid=${gid}:`, e.message);
     res.status(502).json({ error: e.message });
   }
 });
@@ -252,9 +251,11 @@ io.on('connection', (socket) => {
     if (!g || g.teacherSocketId !== socket.id) return;
     if (g.board[col][row]) return; // already used
     g.activeClue = { col, row, timerSecs: timerSecs || 30, timerStart: Date.now() };
-    g.buzzOrder = [];
-    g.verdicts = {};
-    g.submissions = {}; // teamId -> submitted answer string
+    g.buzzOrder    = [];
+    g.verdicts     = {};
+    g.submissions  = {};
+    g.lockedTeamId = null;   // team currently answering
+    g.lockedOut    = new Set(); // teams locked out after wrong answer
     Object.keys(g.teams).forEach(tid => g.verdicts[tid] = null);
     io.to(code).emit('game-update', getPublicGame(code));
   });
@@ -315,16 +316,44 @@ io.on('connection', (socket) => {
     if (!g || !g.activeClue) return;
     const player = g.players[socket.id];
     if (!player) return;
-    if (g.buzzOrder.includes(socket.id)) return; // already buzzed
+    const { teamId } = player;
+    // Block if: board already locked by another team, or this team is locked out
+    if (g.lockedTeamId) return;
+    if (g.lockedOut && g.lockedOut.has(teamId)) return;
+    if (g.buzzOrder.includes(socket.id)) return;
+
     g.buzzOrder.push(socket.id);
-    io.to(code).emit('buzz-update', {
-      buzzOrder: g.buzzOrder,
-      playerNames: g.buzzOrder.map(id => ({
-        id,
-        name: g.players[id]?.name,
-        team: g.teams[g.players[id]?.teamId]?.name
-      }))
+    g.lockedTeamId = teamId; // lock the board
+
+    io.to(code).emit('buzz-locked', {
+      teamId,
+      teamName: g.teams[teamId]?.name,
+      answerSecs: 10
     });
+  });
+
+  // ── TEACHER: RELEASE BUZZ (wrong answer — let others buzz in) ──
+  socket.on('release-buzz', ({ code }) => {
+    const g = games[code];
+    if (!g || g.teacherSocketId !== socket.id) return;
+    if (!g.lockedTeamId) return;
+    // Lock out the team that just failed
+    if (!g.lockedOut) g.lockedOut = new Set();
+    g.lockedOut.add(g.lockedTeamId);
+    g.lockedTeamId = null;
+    io.to(code).emit('buzz-released', {
+      lockedOut: Array.from(g.lockedOut)
+    });
+  });
+
+  // ── TEACHER: CLEAR BUZZ (reset entirely) ──
+  socket.on('clear-buzz', ({ code }) => {
+    const g = games[code];
+    if (!g || g.teacherSocketId !== socket.id) return;
+    g.lockedTeamId = null;
+    g.lockedOut    = new Set();
+    g.buzzOrder    = [];
+    io.to(code).emit('buzz-cleared');
   });
 
   // ── TEACHER: REVEAL ANSWER ──
